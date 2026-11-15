@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+./bin/build
+install -Dm755 target/release/omascribe "$HOME/.local/bin/omascribe"
+install -Dm644 packaging/omascribe.desktop "$HOME/.local/share/applications/omascribe.desktop"
+install -Dm644 packaging/omascribe.svg "$HOME/.local/share/icons/hicolor/scalable/apps/omascribe.svg"
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$HOME/.local/share/applications"
+fi
+printf 'Installed OmaScribe. Launch it from the app menu or run ~/.local/bin/omascribe.\n'

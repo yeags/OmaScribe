@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OmaScribe
+Comment=Slow down music, loop passages, and mark measures and beats
+Exec=omascribe %f
+Icon=omascribe
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=music;transcription;waveform;slow;loop;
+StartupWMClass=omascribe

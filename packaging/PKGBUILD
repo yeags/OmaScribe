@@ -1,0 +1,21 @@
+# Build locally from the source tree: makepkg -p packaging/PKGBUILD
+pkgname=omascribe
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Music transcription workbench with pitch-preserving slowdown'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('ffmpeg' 'alsa-lib' 'libxkbcommon' 'libglvnd' 'wayland' 'libx11' 'libxcursor' 'libxi' 'libxrandr' 'xdg-desktop-portal')
+makedepends=('rust' 'cargo' 'pkgconf')
+
+build() {
+  cd "$startdir"
+  cargo build --release --locked
+}
+package() {
+  cd "$startdir"
+  install -Dm755 target/release/omascribe "$pkgdir/usr/bin/omascribe"
+  install -Dm644 packaging/omascribe.desktop "$pkgdir/usr/share/applications/omascribe.desktop"
+  install -Dm644 packaging/omascribe.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/omascribe.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Exercise the real Hyprland/Wayland event loop on a hidden workspace."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def hypr(*args):
+    return subprocess.check_output(["hyprctl", *args], text=True, timeout=5)
+
+
+def move(address, workspace):
+    result = hypr("eval", 'hl.dispatch(hl.dsp.window.move({'
+                  f'workspace="{workspace}",follow=false,window="address:{address}"'
+                  '}))')
+    if result.strip() != "ok":
+        raise RuntimeError(result.strip())
+
+
+def main():
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        raise RuntimeError("Run this integration test from a Hyprland Wayland session.")
+    binary = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "target/release/omascribe"
+    binary = binary.resolve(strict=True)
+    original_workspace = int(json.loads(hypr("-j", "activeworkspace"))["id"])
+    with tempfile.TemporaryDirectory(prefix="omascribe-workspace-") as directory:
+        log = Path(directory) / "wayland.log"
+        with log.open("w") as stderr:
+            app = subprocess.Popen([str(binary)], stdout=subprocess.DEVNULL, stderr=stderr,
+                                   env=dict(os.environ, WAYLAND_DEBUG="client"))
+            try:
+                window = None
+                for _ in range(100):
+                    if app.poll() is not None:
+                        raise RuntimeError("OmaScribe exited before opening its window.")
+                    window = next((w for w in json.loads(hypr("-j", "clients")) if w["pid"] == app.pid), None)
+                    if window:
+                        break
+                    time.sleep(0.1)
+                if not window or not re.fullmatch(r"0x[0-9a-f]+", window["address"]):
+                    raise RuntimeError("Could not identify the test window.")
+                address = window["address"]
+                time.sleep(2)
+                start = log.stat().st_size
+                move(address, f"special:omascribe-test-{app.pid}")
+                print("Testing the temporary window on a hidden workspace for 12 seconds…", flush=True)
+                time.sleep(12)
+                # Read before restoring visibility: a stuck client answers queued
+                # pings in a burst when shown again, which must not count as a pass.
+                hidden_log = log.read_text(errors="replace")[start:]
+                replies = len(re.findall(r"xdg_wm_base[^\n]*\.pong\(", hidden_log))
+                move(address, original_workspace)
+                if replies < 5:
+                    raise RuntimeError(f"Only {replies} compositor ping replies while hidden; expected at least 5.")
+                time.sleep(1)
+                if app.poll() is not None:
+                    raise RuntimeError("OmaScribe exited after its window was restored.")
+                print(f"PASS: {replies} ping replies while hidden; window restored successfully.")
+            finally:
+                app.terminate()
+                try:
+                    app.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    app.kill()
+                    app.wait()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        sys.exit(1)
