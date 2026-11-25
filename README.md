@@ -30,7 +30,12 @@ then install the resulting package with `pacman -U`.
 - Open audio with the button, Ctrl+O, a file argument, or drag and drop.
   WAV, MP3, Ogg, FLAC, AAC/M4A, Opus, AIFF, and other FFmpeg audio formats work.
 - Press Space to play or pause. Press M at each measure boundary, or B at
-  individual beats. Click a marker in the list to jump to it; × deletes it.
+  individual beats. Drag a marker line or its label to adjust its timing.
+  Where a line overlaps a selection boundary, drag the marker label to move
+  the marker or the bottom grip to trim the selection. Ctrl+Z undoes a move.
+- Click a marker in the list to jump to it. Shift-click a second marker to
+  select the passage between them in either order. Dragging either selected
+  marker updates the passage. Use × to delete a marker.
 - Click the waveform to seek. Drag in either direction to select a passage
   and enable looping. Press Play to hear it repeatedly. Loop without a
   selection repeats the whole song. Esc or right-click clears the selection.
@@ -50,6 +55,10 @@ then install the resulting package with `pacman -U`.
   while a background worker prepares the change, then resumes at the same
   original-song position if it was playing. The active tempo changes only
   after processing succeeds. Markers always use original-song seconds.
+- Toggle **Bypass tempo & EQ** to hear the song at normal speed with flat EQ
+  and stereo center reduction off. Toggle it again to hear the applied settings
+  at the same song position. This comparison is temporary. Sessions save the
+  applied settings.
 - Adjust five EQ bands (80 Hz, 250 Hz, 1 kHz, 4 kHz, 10 kHz), or choose Flat,
   Bass focus, Melody focus, or Vocal reduction, and apply. Output limiting
   and a volume control help avoid clipping.

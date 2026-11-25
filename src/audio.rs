@@ -124,6 +124,11 @@ pub struct Transport {
     pub volume: f32,
 }
 impl Transport {
+    pub fn set_audio(&mut self, samples: Arc<Vec<f32>>, speed: f64, position: f64) {
+        self.samples = samples;
+        self.speed = speed;
+        self.seek(position);
+    }
     pub fn position(&self) -> f64 {
         self.frame as f64 / self.rate.max(1) as f64 * self.speed
     }
@@ -243,6 +248,30 @@ pub fn peaks(samples: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn switching_playback_buffers_keeps_song_position_and_loop() {
+        let original = Arc::new(vec![0.25; 200]);
+        let modified = Arc::new(vec![0.75; 400]);
+        let mut t = Transport {
+            rate: 10,
+            duration: 10.,
+            speed: 0.5,
+            frame: 100,
+            samples: modified.clone(),
+            playing: true,
+            volume: 1.,
+            looping: true,
+            selection: Some((4., 6.)),
+        };
+        t.set_audio(original, 1., t.position());
+        assert_eq!(t.position(), 5.);
+        assert_eq!(t.next(), [0.25; 2]);
+        t.set_audio(modified, 0.5, t.position());
+        assert_eq!(t.position(), 5.1);
+        assert_eq!(t.next(), [0.75; 2]);
+        assert!(t.looping && t.playing);
+        assert_eq!(t.selection, Some((4., 6.)));
+    }
     #[test]
     fn looping_and_source_clock() {
         let mut t = Transport {

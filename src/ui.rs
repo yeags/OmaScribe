@@ -15,12 +15,19 @@ const MAX_ZOOM: f64 = 128.;
 
 #[derive(Clone, Copy)]
 enum WaveDrag {
+    Marker { index: usize, grab_offset: f64 },
     Select { start: f64 },
     Start { grab_offset: f64 },
     End { grab_offset: f64 },
 }
 
-type Loaded = Result<(Session, Arc<Vec<f32>>, Vec<f32>, f64), String>;
+#[derive(Default)]
+struct PlaybackBuffers {
+    original: Arc<Vec<f32>>,
+    modified: Arc<Vec<f32>>,
+}
+
+type Loaded = Result<(Session, PlaybackBuffers, Vec<f32>, f64), String>;
 
 enum FileResult {
     Open(Option<PathBuf>),
@@ -43,6 +50,10 @@ pub struct App {
     zoom: f64,
     offset: f64,
     drag: Option<WaveDrag>,
+    marker_anchor: Option<usize>,
+    marker_end: Option<usize>,
+    buffers: PlaybackBuffers,
+    bypass: bool,
     help: bool,
     undo: Vec<Vec<Marker>>,
     redo: Vec<Vec<Marker>>,
@@ -85,6 +96,10 @@ impl App {
             zoom: 1.,
             offset: 0.,
             drag: None,
+            marker_anchor: None,
+            marker_end: None,
+            buffers: PlaybackBuffers::default(),
+            bypass: false,
             help: false,
             undo: vec![],
             redo: vec![],
@@ -144,11 +159,85 @@ impl App {
             return;
         }
         let time = self.position().min(self.duration);
+        self.forget_marker_selection();
+        self.drag = None;
         self.checkpoint();
         self.session.markers.push(Marker { time, kind });
         self.session
             .markers
             .sort_by(|a, b| a.time.total_cmp(&b.time));
+    }
+    fn forget_marker_selection(&mut self) {
+        self.marker_anchor = None;
+        self.marker_end = None;
+    }
+    fn select_marker(&mut self, index: usize, extend: bool) {
+        if extend
+            && let Some(anchor) = self.marker_anchor
+            && anchor != index
+        {
+            self.marker_end = Some(index);
+            self.update_marker_range();
+            if let Some((start, _)) = self.session.selection {
+                self.seek(start);
+            }
+            self.sync_selection();
+        } else {
+            self.marker_anchor = Some(index);
+            self.marker_end = None;
+            self.seek(self.session.markers[index].time);
+        }
+    }
+    fn update_marker_range(&mut self) {
+        if let (Some(a), Some(b)) = (self.marker_anchor, self.marker_end) {
+            let (a, b) = (self.session.markers[a].time, self.session.markers[b].time);
+            self.session.selection = (a != b).then_some((a.min(b), a.max(b)));
+        }
+    }
+    fn move_marker(&mut self, index: usize, time: f64) -> usize {
+        let markers = &mut self.session.markers;
+        markers[index].time = time;
+        let mut dest = index;
+        while dest > 0 && markers[dest - 1].time > time {
+            dest -= 1;
+        }
+        while dest + 1 < markers.len() && markers[dest + 1].time < time {
+            dest += 1;
+        }
+        if dest != index {
+            let marker = markers.remove(index);
+            markers.insert(dest, marker);
+            for selected in [&mut self.marker_anchor, &mut self.marker_end]
+                .into_iter()
+                .flatten()
+            {
+                if *selected == index {
+                    *selected = dest;
+                } else if (dest..index).contains(selected) {
+                    *selected += 1;
+                } else if (index + 1..=dest).contains(selected) {
+                    *selected -= 1;
+                }
+            }
+        }
+        self.update_marker_range();
+        dest
+    }
+    fn toggle_bypass(&mut self) {
+        self.bypass = !self.bypass;
+        if let Some(e) = &self.engine {
+            let mut t = e.state.lock().unwrap();
+            let position = t.position();
+            if self.bypass {
+                t.set_audio(self.buffers.original.clone(), 1., position);
+            } else {
+                t.set_audio(
+                    self.buffers.modified.clone(),
+                    self.session.effects.speed,
+                    position,
+                );
+            }
+        }
     }
     fn sync_selection(&self) {
         if let Some(e) = &self.engine {
@@ -210,7 +299,11 @@ impl App {
         let existing_wave = if fresh {
             None
         } else {
-            Some((self.wave.clone(), self.duration))
+            Some((
+                self.wave.clone(),
+                self.duration,
+                self.buffers.original.clone(),
+            ))
         };
         let (tx, rx) = mpsc::channel();
         self.result = Some(rx);
@@ -220,32 +313,38 @@ impl App {
                     .map_err(|e| format!("Cannot open {}: {e}", session.audio.display()))?;
                 let mut session = session;
                 session.audio = path;
-                let (wave, duration, original) = if let Some((wave, duration)) = existing_wave {
-                    (wave, duration, None)
+                let (wave, duration, original) = if let Some(existing) = existing_wave {
+                    existing
                 } else {
                     let original = audio::decode(&session.audio, rate, &Effects::default())?;
                     let duration = original.len() as f64 / (rate as f64 * 2.);
-                    (audio::peaks(&original), duration, Some(original))
+                    (audio::peaks(&original), duration, Arc::new(original))
                 };
                 session.markers.retain(|m| m.time <= duration);
                 session.selection = session.selection.and_then(|(a, b)| {
                     let b = b.min(duration);
                     (a < b).then_some((a, b))
                 });
-                let samples = if let Some(original) =
-                    original.filter(|_| session.effects == Effects::default())
-                {
-                    original
+                let modified = if session.effects == Effects::default() {
+                    original.clone()
                 } else {
-                    audio::decode(&session.audio, rate, &session.effects)?
+                    Arc::new(audio::decode(&session.audio, rate, &session.effects)?)
                 };
-                Ok((session, Arc::new(samples), wave, duration))
+                Ok((
+                    session,
+                    PlaybackBuffers { original, modified },
+                    wave,
+                    duration,
+                ))
             })();
             let _ = tx.send(result);
         });
         if fresh {
             self.duration = 0.;
             self.wave.clear();
+            self.buffers = PlaybackBuffers::default();
+            self.forget_marker_selection();
+            self.drag = None;
             self.undo.clear();
             self.redo.clear();
             self.zoom = 1.;
@@ -365,6 +464,8 @@ impl App {
             self.save(ctx.input(|i| i.modifiers.shift));
         }
         if !self.busy() && command && key(egui::Key::Z) {
+            self.forget_marker_selection();
+            self.drag = None;
             if ctx.input(|i| i.modifiers.shift) {
                 if let Some(next) = self.redo.pop() {
                     self.undo.push(self.session.markers.clone());
@@ -390,6 +491,7 @@ impl App {
                 self.sync_selection();
             }
             if key(egui::Key::Escape) {
+                self.forget_marker_selection();
                 self.session.selection = None;
                 self.sync_selection();
             }
@@ -565,6 +667,23 @@ impl App {
                 _ => None,
             }
         };
+        let near_marker = |pos: Pos2, markers: &[Marker]| {
+            if !plot.contains(pos) {
+                return None;
+            }
+            markers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, marker)| {
+                    let x = to_x(marker.time);
+                    let dx = pos.x - x;
+                    let on_label = pos.y <= plot.top() + 19. && (0.0..=19.0).contains(&dx);
+                    (plot.x_range().contains(x) && (dx.abs() <= 6. || on_label))
+                        .then_some((index, dx.abs()))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(index, _)| index)
+        };
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0., Color32::from_rgb(13, 18, 24));
         if self.duration <= 0. {
@@ -578,20 +697,32 @@ impl App {
             return;
         }
         if self.ready() {
-            if response.drag_started()
+            if response.drag_started_by(egui::PointerButton::Primary)
                 && let Some(pos) = ui.input(|i| i.pointer.press_origin())
             {
-                self.drag = Some(match near_handle(pos, self.session.selection) {
-                    Some(true) => WaveDrag::Start {
-                        grab_offset: self.session.selection.unwrap().0 - raw_time(pos.x),
-                    },
-                    Some(false) => WaveDrag::End {
-                        grab_offset: self.session.selection.unwrap().1 - raw_time(pos.x),
-                    },
-                    None => WaveDrag::Select {
-                        start: from_x(pos.x),
-                    },
-                });
+                let handle = near_handle(pos, self.session.selection);
+                if let Some(index) = near_marker(pos, &self.session.markers)
+                    && (handle.is_none() || pos.y <= plot.top() + 19.)
+                {
+                    self.checkpoint();
+                    self.drag = Some(WaveDrag::Marker {
+                        index,
+                        grab_offset: self.session.markers[index].time - raw_time(pos.x),
+                    });
+                } else {
+                    self.forget_marker_selection();
+                    self.drag = Some(match handle {
+                        Some(true) => WaveDrag::Start {
+                            grab_offset: self.session.selection.unwrap().0 - raw_time(pos.x),
+                        },
+                        Some(false) => WaveDrag::End {
+                            grab_offset: self.session.selection.unwrap().1 - raw_time(pos.x),
+                        },
+                        None => WaveDrag::Select {
+                            start: from_x(pos.x),
+                        },
+                    });
+                }
             }
             if (response.dragged() || response.drag_stopped())
                 && let (Some(drag), Some(pos)) = (self.drag, response.interact_pointer_pos())
@@ -599,6 +730,13 @@ impl App {
                 let time = from_x(pos.x);
                 let min_length = 0.03_f64.min(self.duration);
                 match drag {
+                    WaveDrag::Marker { index, grab_offset } => {
+                        let index = self.move_marker(
+                            index,
+                            (raw_time(pos.x) + grab_offset).clamp(0., duration),
+                        );
+                        self.drag = Some(WaveDrag::Marker { index, grab_offset });
+                    }
                     WaveDrag::Select { start } if (start - time).abs() >= min_length => {
                         self.session.selection = Some((start.min(time), start.max(time)));
                         self.session.looping = true;
@@ -638,15 +776,17 @@ impl App {
                 self.seek(from_x(pos.x));
             }
             if response.secondary_clicked() {
+                self.forget_marker_selection();
                 self.session.selection = None;
                 self.sync_selection();
             }
             if self
                 .drag
                 .is_some_and(|d| !matches!(d, WaveDrag::Select { .. }))
-                || response
-                    .hover_pos()
-                    .is_some_and(|pos| near_handle(pos, self.session.selection).is_some())
+                || response.hover_pos().is_some_and(|pos| {
+                    near_handle(pos, self.session.selection).is_some()
+                        || near_marker(pos, &self.session.markers).is_some()
+                })
             {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
@@ -819,18 +959,22 @@ impl eframe::App for App {
         if let Some(result) = received {
             self.result = None;
             match result {
-                Ok((session, samples, wave, duration)) => {
+                Ok((session, buffers, wave, duration)) => {
                     let fresh = self.duration == 0.;
                     self.session = session;
                     self.draft = self.session.effects.clone();
                     self.wave = wave;
+                    self.buffers = buffers;
+                    self.bypass = false;
                     self.duration = duration;
                     if let Some(e) = &self.engine {
                         let mut t = e.state.lock().unwrap();
-                        t.samples = samples;
-                        t.speed = self.session.effects.speed;
                         t.duration = duration;
-                        t.seek(self.resume_position);
+                        t.set_audio(
+                            self.buffers.modified.clone(),
+                            self.session.effects.speed,
+                            self.resume_position,
+                        );
                         t.playing = self.resume;
                     }
                     self.sync_selection();
@@ -868,6 +1012,7 @@ impl eframe::App for App {
             ui.add_space(10.);
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("OmaScribe").strong().color(TEAL));
+                ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
                 ui.label(
                     egui::RichText::new("MUSIC TRANSCRIPTION WORKBENCH")
                         .small()
@@ -910,7 +1055,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.add_space(12.);
                 ui.heading("Markers");
-                ui.label("Map the pulse as you listen.");
+                ui.label("Click to jump. Shift-click a second marker to select the passage.");
                 ui.add_space(8.);
                 ui.horizontal(|ui| {
                     if ui
@@ -943,10 +1088,20 @@ impl eframe::App for App {
                         };
                         ui.horizontal(|ui| {
                             if ui
-                                .button(format!("{}   {}", clock(marker.time), label))
+                                .add_enabled(
+                                    self.ready(),
+                                    egui::SelectableLabel::new(
+                                        self.marker_anchor == Some(index)
+                                            || self.marker_end == Some(index),
+                                        format!("{}   {}", clock(marker.time), label),
+                                    ),
+                                )
                                 .clicked()
                             {
-                                jump = Some(marker.time);
+                                jump = Some((
+                                    index,
+                                    ui.input(|i| i.modifiers.shift || i.modifiers.command),
+                                ));
                             }
                             if ui
                                 .add_enabled(!self.busy(), egui::Button::new("×").small())
@@ -967,11 +1122,13 @@ impl eframe::App for App {
                         );
                     }
                 });
-                if let Some(time) = jump {
-                    self.seek(time);
+                if let Some((index, extend)) = jump {
+                    self.select_marker(index, extend);
                 }
                 if let Some(index) = delete {
                     self.checkpoint();
+                    self.forget_marker_selection();
+                    self.drag = None;
                     self.session.markers.remove(index);
                 }
             });
@@ -990,7 +1147,7 @@ impl eframe::App for App {
                 if ui.add_enabled(self.ready(), egui::Button::new("■  Stop")).clicked() { if let Some(e) = &self.engine { e.state.lock().unwrap().playing = false; } self.seek(0.); }
                 ui.label(egui::RichText::new(clock(self.position())).monospace().size(20.));
                 if ui.add_enabled(self.ready(), egui::Checkbox::new(&mut self.session.looping, "Loop  [L]")).changed() { self.sync_selection(); }
-                if let Some((a,b)) = self.session.selection { ui.label(format!("{:.2}–{:.2}s", a,b)); if ui.small_button("Clear").clicked() { self.session.selection = None; self.sync_selection(); } }
+                if let Some((a,b)) = self.session.selection { ui.label(format!("{:.2}–{:.2}s", a,b)); if ui.small_button("Clear").clicked() { self.forget_marker_selection(); self.session.selection = None; self.sync_selection(); } }
             });
             self.zoom_controls(ui);
             ui.horizontal(|ui| {
@@ -1016,6 +1173,10 @@ impl eframe::App for App {
                     }
                 });
                 ui.horizontal(|ui| {
+                    let mut bypass = self.bypass;
+                    if ui.add_enabled(self.ready() && self.session.effects != Effects::default(), egui::Checkbox::new(&mut bypass, "Bypass tempo & EQ")).on_hover_text("Listen at normal speed with flat EQ and stereo center reduction off.").changed() {
+                        self.toggle_bypass();
+                    }
                     ui.checkbox(&mut self.draft.vocal_cut, "Reduce stereo center");
                     if ui.add_enabled(self.ready() && self.draft != self.session.effects, egui::Button::new("Apply tempo & EQ")).clicked() {
                         let mut session = self.session.clone(); session.effects = self.draft.clone(); self.start_render(session, false);
@@ -1092,6 +1253,10 @@ mod tests {
             zoom: 1.,
             offset: 0.,
             drag: None,
+            marker_anchor: None,
+            marker_end: None,
+            buffers: PlaybackBuffers::default(),
+            bypass: false,
             help: false,
             undo: vec![],
             redo: vec![],
@@ -1241,6 +1406,55 @@ mod tests {
     }
     fn wave_x(time: f64, zoom: f64, offset: f64) -> f32 {
         8. + ((time - offset) / (10. / zoom)) as f32 * 784.
+    }
+    #[test]
+    fn dragging_a_selected_marker_past_the_other_keeps_the_range_and_marker_order() {
+        for kind in [Kind::Beat, Kind::Measure] {
+            let mut app = fixture();
+            app.zoom = 2.;
+            app.offset = 2.;
+            app.session.markers = vec![
+                Marker {
+                    time: 3.,
+                    kind: kind.clone(),
+                },
+                Marker {
+                    time: 5.,
+                    kind: Kind::Beat,
+                },
+            ];
+            app.select_marker(1, false);
+            app.select_marker(0, true);
+            assert_eq!(app.session.selection, Some((3., 5.)));
+            let original = app.session.markers.clone();
+            trim(
+                &mut app,
+                &egui::Context::default(),
+                Pos2::new(wave_x(3., 2., 2.) + 4., 45.),
+                Pos2::new(wave_x(6., 2., 2.) + 4., 45.),
+            );
+            assert_eq!(app.undo, vec![original]);
+            assert_eq!((app.marker_anchor, app.marker_end), (Some(0), Some(1)));
+            assert_eq!(app.session.markers[1].kind, kind);
+            let (a, b) = app.session.selection.unwrap();
+            assert_eq!(a, 5.);
+            assert!((b - 6.).abs() < 0.001);
+            assert_eq!(app.session.markers[1].time, b);
+        }
+    }
+    #[test]
+    fn coincident_markers_do_not_create_an_empty_loop() {
+        let mut app = fixture();
+        app.session.markers = vec![
+            Marker {
+                time: 2.,
+                kind: Kind::Beat
+            };
+            2
+        ];
+        app.select_marker(0, false);
+        app.select_marker(1, true);
+        assert_eq!(app.session.selection, None);
     }
     #[test]
     fn selection_handles_adjust_each_end_without_replacing_selection() {
